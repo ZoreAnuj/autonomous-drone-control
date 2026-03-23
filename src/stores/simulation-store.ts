@@ -1,0 +1,210 @@
+/**
+ * @module simulation-store
+ * @description Zustand store for mission simulation playback state.
+ * Manages playback controls, camera mode, and elapsed time.
+ * Clock-backed: all time advancement driven by CesiumJS Clock,
+ * synced back to store via syncFromClock() for HUD/controls.
+ * Non-persisted — resets on page reload.
+ * @license GPL-3.0-only
+ */
+
+import { create } from "zustand";
+import { JulianDate, type Viewer as CesiumViewer } from "cesium";
+
+export type PlaybackState = "stopped" | "playing" | "paused";
+export type CameraMode = "topdown" | "follow" | "orbit" | "free";
+
+/** Position synced from CesiumJS 3D entity each tick (authoritative for HUD). */
+export interface SyncedPosition {
+  lat: number;
+  lon: number;
+  altAgl: number;
+  heading: number;
+  speed: number;
+  waypointIndex: number;
+}
+
+interface SimulationStoreState {
+  playbackState: PlaybackState;
+  playbackSpeed: number;
+  elapsed: number;
+  totalDuration: number;
+  cameraMode: CameraMode;
+  /** ID of the library plan being simulated (for plan-to-simulate tracking). */
+  sourceLibraryPlanId: string | null;
+  /** Position synced from 3D entity — null until first tick with resolved positions. */
+  syncedPosition: SyncedPosition | null;
+  /** Whether follow camera heading is locked to flight heading. */
+  followHeadingLocked: boolean;
+
+  play: () => void;
+  pause: () => void;
+  stop: () => void;
+  seek: (time: number) => void;
+  stepForward: () => void;
+  stepBack: () => void;
+  setSpeed: (speed: number) => void;
+  setCameraMode: (mode: CameraMode) => void;
+  setTotalDuration: (duration: number) => void;
+  setSourcePlanId: (id: string | null) => void;
+  syncFromClock: () => void;
+  syncPosition: (pos: SyncedPosition) => void;
+  toggleFollowHeading: () => void;
+  reset: () => void;
+}
+
+const STEP_SECONDS = 1;
+
+/** Quantize to 3 decimal places — matches syncFromClock precision */
+const quantize = (v: number) => Math.round(v * 1000) / 1000;
+
+// Module-level clock binding (CesiumJS objects are not serializable in Zustand)
+let _viewer: CesiumViewer | null = null;
+let _startJulian: JulianDate | null = null;
+const _scratchJulian = new JulianDate();
+
+export function bindSimViewer(viewer: CesiumViewer, startJulian: JulianDate) {
+  if (_viewer === viewer) return; // Already bound to this viewer
+  _viewer = viewer;
+  _startJulian = JulianDate.clone(startJulian);
+}
+
+export function unbindSimViewer(viewer?: CesiumViewer) {
+  if (viewer && _viewer !== viewer) return; // Different viewer, don't unbind
+  _viewer = null;
+  _startJulian = null;
+}
+
+function seekClock(seconds: number) {
+  if (_viewer && !_viewer.isDestroyed() && _startJulian) {
+    JulianDate.addSeconds(_startJulian, seconds, _scratchJulian);
+    // Clone to avoid aliasing — Clock stores currentTime by reference
+    _viewer.clock.currentTime = JulianDate.clone(_scratchJulian);
+    requestRender();
+  }
+}
+
+function requestRender() {
+  if (_viewer && !_viewer.isDestroyed()) _viewer.scene.requestRender();
+}
+
+export const useSimulationStore = create<SimulationStoreState>()((set, get) => ({
+  playbackState: "stopped",
+  playbackSpeed: 1,
+  elapsed: 0,
+  totalDuration: 0,
+  cameraMode: "topdown",
+  sourceLibraryPlanId: null,
+  syncedPosition: null,
+  followHeadingLocked: true,
+
+  play: () => {
+    if (!_viewer || _viewer.isDestroyed()) return;
+    const { elapsed, totalDuration } = get();
+    // If at the end, restart from beginning
+    if (elapsed >= totalDuration && totalDuration > 0) {
+      set({ playbackState: "playing", elapsed: 0 });
+      seekClock(0);
+    } else {
+      set({ playbackState: "playing" });
+    }
+    _viewer.clock.shouldAnimate = true;
+  },
+
+  pause: () => {
+    set({ playbackState: "paused" });
+    if (_viewer && !_viewer.isDestroyed()) {
+      _viewer.clock.shouldAnimate = false;
+    }
+  },
+
+  stop: () => {
+    set({ playbackState: "stopped", elapsed: 0 });
+    if (_viewer && !_viewer.isDestroyed()) {
+      _viewer.clock.shouldAnimate = false;
+    }
+    seekClock(0);
+  },
+
+  seek: (time) => {
+    const { totalDuration } = get();
+    const clamped = quantize(Math.max(0, Math.min(time, totalDuration)));
+    set({ elapsed: clamped });
+    seekClock(clamped);
+  },
+
+  stepForward: () => {
+    const { elapsed, totalDuration } = get();
+    if (totalDuration === 0) return;
+    const next = quantize(Math.min(elapsed + STEP_SECONDS, totalDuration));
+    set({ elapsed: next });
+    seekClock(next);
+  },
+
+  stepBack: () => {
+    const { elapsed, totalDuration } = get();
+    if (totalDuration === 0) return;
+    const prev = quantize(Math.max(elapsed - STEP_SECONDS, 0));
+    set({ elapsed: prev });
+    seekClock(prev);
+  },
+
+  setSpeed: (playbackSpeed) => {
+    set({ playbackSpeed });
+    if (_viewer && !_viewer.isDestroyed()) {
+      _viewer.clock.multiplier = playbackSpeed;
+    }
+  },
+
+  setCameraMode: (cameraMode) => set({ cameraMode }),
+
+  setSourcePlanId: (sourceLibraryPlanId) => set({ sourceLibraryPlanId }),
+
+  syncPosition: (syncedPosition) => set({ syncedPosition }),
+
+  toggleFollowHeading: () => set((s) => ({ followHeadingLocked: !s.followHeadingLocked })),
+
+  setTotalDuration: (totalDuration) => {
+    set({ totalDuration });
+    if (_viewer && !_viewer.isDestroyed() && _startJulian) {
+      const stopTime = new JulianDate();
+      JulianDate.addSeconds(_startJulian, totalDuration, stopTime);
+      _viewer.clock.stopTime = stopTime;
+    }
+  },
+
+  syncFromClock: () => {
+    if (!_viewer || _viewer.isDestroyed() || !_startJulian) return;
+    const elapsed = JulianDate.secondsDifference(
+      _viewer.clock.currentTime,
+      _startJulian
+    );
+    const { totalDuration, playbackState, elapsed: current } = get();
+    const clamped = quantize(Math.max(0, Math.min(elapsed, totalDuration)));
+
+    // Detect CesiumJS auto-stop (ClockRange.CLAMPED stops clock at stopTime)
+    if (playbackState === "playing" && !_viewer.clock.shouldAnimate) {
+      set({ elapsed: clamped, playbackState: "paused" });
+    } else if (clamped !== current) {
+      set({ elapsed: clamped });
+    }
+  },
+
+  reset: () => {
+    set({
+      playbackState: "stopped",
+      playbackSpeed: 1,
+      elapsed: 0,
+      totalDuration: 0,
+      cameraMode: "topdown",
+      sourceLibraryPlanId: null,
+      syncedPosition: null,
+      followHeadingLocked: true,
+    });
+    if (_viewer && !_viewer.isDestroyed()) {
+      _viewer.clock.shouldAnimate = false;
+      _viewer.clock.multiplier = 1;
+    }
+    seekClock(0);
+  },
+}));

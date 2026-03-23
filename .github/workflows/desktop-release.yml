@@ -1,0 +1,155 @@
+name: Desktop Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Next.js
+        run: npm run build
+
+      - name: Compile Electron
+        run: npm run electron:compile
+
+      - name: Build macOS app
+        run: npx electron-builder --mac --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-build
+          path: release/*.dmg
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Next.js
+        run: npm run build
+
+      - name: Compile Electron
+        run: npm run electron:compile
+
+      - name: Build Windows app
+        run: npx electron-builder --win --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: release/*.exe
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Next.js
+        run: npm run build
+
+      - name: Compile Electron
+        run: npm run electron:compile
+
+      - name: Build Linux app
+        run: npx electron-builder --linux --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-build
+          path: release/*.AppImage
+
+  update-release-notes:
+    needs: [build-macos, build-windows, build-linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Update release notes
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = context.ref.replace('refs/tags/', '');
+            const { data: releases } = await github.rest.repos.listReleases({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const release = releases.find(r => r.tag_name === tag);
+            if (!release) {
+              core.setFailed(`Release for tag ${tag} not found`);
+              return;
+            }
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: release.id,
+              draft: false,
+              body: [
+                `## Altnautica Command ${tag}`,
+                '',
+                '### What\'s New',
+                '',
+                '- **Air Traffic tab** — live ADS-B tracking, 3D airspace zones, and flyability assessment',
+                '- **Survey presets and auto-generation** for mission planning',
+                '- **Virtualized parameter grid** for snappier performance on large param lists',
+                '- **Command tab** with drone agent integration',
+                '- **Drone pairing** and multi-polygon survey support',
+                '- Consolidated overlays, cleaner UI layout, error boundaries for graceful failures',
+                '- Ring buffer optimization, batch comment queries (N+1 fix), airspace data caching',
+                '- Unit tests for terrain, MSP, PID scoring, survey generator, KML parser, and more',
+                '',
+                '### Bug Fixes',
+                '',
+                '- Pattern editor instruction text, drawing vertex reset on circle completion',
+                '- Convex query skip guard in demo mode, MAVLink adapter state assignment order',
+                '- Calibration command handling fixes',
+                '',
+                '### Downloads',
+                '',
+                '- **macOS:** `.dmg` (Intel and Apple Silicon)',
+                '- **Windows:** `.exe` installer',
+                '- **Linux:** `.AppImage`',
+                '',
+                '> Desktop builds lag behind the web version by a release or two.',
+                '> For the latest, use [command.altnautica.com](https://command.altnautica.com)',
+                '> or clone the repo and run locally (`npm ci && npm run dev`).',
+              ].join('\n'),
+            });
